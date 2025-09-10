@@ -616,7 +616,11 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // Added: record callee (B) full STUN NAT type
         if !phs.id.is_empty() {
-            if let Some(st_enum) = phs.stun_nat_type { if let Ok(st) = st_enum.enum_value() { self.update_stun_nat_type(&phs.id, st); } }
+            if let Some(st_enum) = phs.stun_nat_type {
+                if let Ok(st) = st_enum.enum_value() {
+                    self.update_stun_nat_type(&phs.id, st).await;
+                }
+            }
         }
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
@@ -631,6 +635,7 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            stun_nat_type: phs.stun_nat_type.clone(),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -690,13 +695,26 @@ impl RendezvousServer {
         let initiator_stun = ph.stun_nat_type.and_then(|v| v.enum_value().ok());
         if !key.is_empty() && ph.licence_key != key {
             let mut msg_out = RendezvousMessage::new();
-            msg_out.set_punch_hole_response(PunchHoleResponse { failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(), ..Default::default() });
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
             return Ok((msg_out, None));
         }
         let id = ph.id;
         if let Some(peer) = self.pm.get(&id).await {
-            let (elapsed, peer_addr) = { let r = peer.read().await; (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr) };
-            if elapsed >= REG_TIMEOUT { let mut msg_out = RendezvousMessage::new(); msg_out.set_punch_hole_response(PunchHoleResponse { failure: punch_hole_response::Failure::OFFLINE.into(), ..Default::default() }); return Ok((msg_out, None)); }
+            let (elapsed, peer_addr) = {
+                let r = peer.read().await;
+                (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
+            };
+            if elapsed >= REG_TIMEOUT {
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    failure: punch_hole_response::Failure::OFFLINE.into(),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            }
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
@@ -704,44 +722,73 @@ impl RendezvousServer {
             let target_stun = self.get_stun_nat_type(&id).await;
             // If nat_type is UNKNOWN but STUN type exists, map STUN to nat_type
             if let NatType::UNKNOWN_NAT = ph.nat_type.enum_value().unwrap_or(NatType::UNKNOWN_NAT) {
-                if let Some(st) = initiator_stun { ph.nat_type = Self::map_stun_to_nat(st).into(); }
+                if let Some(st) = initiator_stun {
+                    ph.nat_type = Self::map_stun_to_nat(st).into();
+                }
             }
             // Decide whether relay is needed (STUN-based decision takes precedence)
             let stun_force_relay = Self::stun_need_relay(initiator_stun, target_stun);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
             let mut force_relay = false;
-            if stun_force_relay || ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            if stun_force_relay || ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan)
+            {
                 // https://github.com/rustdesk/rustdesk-server/issues/24
-                if peer_is_lan { relay_server = self.inner.local_ip.clone(); }
+                if peer_is_lan {
+                    relay_server = self.inner.local_ip.clone();
+                }
                 ph.nat_type = NatType::SYMMETRIC.into();
                 force_relay = true;
             }
             log::debug!("Punch req decision id={} force={} stun_force={} init_stun={:?} target_stun={:?} lan_a={} lan_b={} relay={} nat_type={:?}", id, force_relay, stun_force_relay, initiator_stun, target_stun, is_lan, peer_is_lan, relay_server, ph.nat_type.enum_value());
-            let same_intranet: bool = !ws && (peer_is_lan && is_lan || {
-                match (peer_addr, addr) {
-                    (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-                    (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
-                    _ => false,
-                }
-            });
+            let same_intranet: bool = !ws
+                && (peer_is_lan && is_lan || {
+                    match (peer_addr, addr) {
+                        (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
+                        (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
+                        _ => false,
+                    }
+                });
             let socket_addr = AddrMangle::encode(addr).into();
             if same_intranet {
-                msg_out.set_fetch_local_addr(FetchLocalAddr { socket_addr, relay_server, ..Default::default() });
+                msg_out.set_fetch_local_addr(FetchLocalAddr {
+                    socket_addr,
+                    relay_server,
+                    ..Default::default()
+                });
             } else {
-                msg_out.set_punch_hole(PunchHole { socket_addr, nat_type: ph.nat_type, relay_server, force_relay, ..Default::default() });
+                msg_out.set_punch_hole(PunchHole {
+                    socket_addr,
+                    nat_type: ph.nat_type,
+                    stun_nat_type: ph.stun_nat_type,
+                    relay_server,
+                    force_relay,
+                    ..Default::default()
+                });
             }
             Ok((msg_out, Some(peer_addr)))
         } else {
             let mut msg_out = RendezvousMessage::new();
-            msg_out.set_punch_hole_response(PunchHoleResponse { failure: punch_hole_response::Failure::ID_NOT_EXIST.into(), ..Default::default() });
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
+                ..Default::default()
+            });
             Ok((msg_out, None))
         }
     }
 
     // Added: STUN NAT type storage and decision helpers
-    async fn update_stun_nat_type(&self, id: &str, t: StunNatType) { self.stun_nat_types.lock().await.insert(id.to_owned(), t); }
-    async fn get_stun_nat_type(&self, id: &str) -> Option<StunNatType> { self.stun_nat_types.lock().await.get(id).cloned() }
-    fn map_stun_to_nat(t: StunNatType) -> NatType { match t { StunNatType::SYMMETRIC => NatType::SYMMETRIC, _ => NatType::ASYMMETRIC } }
+    async fn update_stun_nat_type(&self, id: &str, t: StunNatType) {
+        self.stun_nat_types.lock().await.insert(id.to_owned(), t);
+    }
+    async fn get_stun_nat_type(&self, id: &str) -> Option<StunNatType> {
+        self.stun_nat_types.lock().await.get(id).cloned()
+    }
+    fn map_stun_to_nat(t: StunNatType) -> NatType {
+        match t {
+            StunNatType::SYMMETRIC => NatType::SYMMETRIC,
+            _ => NatType::ASYMMETRIC,
+        }
+    }
     fn stun_need_relay(a: Option<StunNatType>, b: Option<StunNatType>) -> bool {
         // Rule: relay required if any side is SYMMETRIC; other combinations try direct connection
         matches!(a, Some(StunNatType::SYMMETRIC)) || matches!(b, Some(StunNatType::SYMMETRIC))
